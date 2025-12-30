@@ -211,4 +211,3 @@ echo "Verify    : ip link show $IFACE | grep xdp"
 echo "Logs      : journalctl -u cibe-xdp.service -n 30 --no-pager"
 EOF
 )"
-
