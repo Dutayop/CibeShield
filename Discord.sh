@@ -618,7 +618,137 @@ fi
 echo "$IFACE" > interface.conf
 echo "$WEBHOOK_URL" > webhook.conf
 
-# Create Discord monitor with chart generation
+# Create Discord notifier script with proper heredoc
+echo -e "${BLUE}[→] Creating Discord notifier script...${NC}"
+
+cat > discord_notify.sh << '\''EOF_NOTIFY'\''
+#!/bin/bash
+
+WEBHOOK_URL=$(cat /opt/cibe-xdp/webhook.conf 2>/dev/null)
+
+if [ -z "$WEBHOOK_URL" ]; then
+    echo "Error: Webhook URL not configured"
+    exit 1
+fi
+
+TYPE="$1"
+IP="$2"
+PORT="$3"
+MBPS="$4"
+TOTAL_GB="$5"
+CHART_DATA="$6"
+
+# Get WIB timestamp
+get_wib_timestamp() {
+    TZ=Asia/Jakarta date "+%d %B %Y (%H.%M)"
+}
+
+# Generate chart URL
+generate_chart_url() {
+    local data="$1"
+    # URL encode for QuickChart
+    echo "https://quickchart.io/chart?width=800&height=400&c={type:\"line\",data:{labels:[\"0s\",\"5s\",\"10s\",\"15s\",\"20s\"],datasets:[{label:\"Attack Rate (Mbps)\",data:[$data],borderColor:\"rgb(255,99,132)\",backgroundColor:\"rgba(255,99,132,0.2)\",fill:true}]},options:{title:{display:true,text:\"DDoS Attack Traffic Rate\"},scales:{yAxes:[{ticks:{beginAtZero:true}}]}}}"
+}
+
+TIMESTAMP=$(get_wib_timestamp)
+CHART_URL=$(generate_chart_url "$CHART_DATA")
+
+if [ "$TYPE" = "start" ]; then
+    # Red embed - Attack Start
+    cat <<EOF | curl -s -X POST "$WEBHOOK_URL" \
+        -H "Content-Type: application/json" \
+        -d @- > /dev/null
+{
+  "embeds": [{
+    "title": "🚨 Serangan DDoS Terdeteksi!!",
+    "description": "Serangan DDoS terdeteksi dan akan segera di proses oleh sistem Cibe Shield",
+    "color": 15548997,
+    "fields": [
+      {
+        "name": "IP Attacker",
+        "value": "$IP",
+        "inline": false
+      },
+      {
+        "name": "Serangan Mengarah Port",
+        "value": "$PORT",
+        "inline": false
+      },
+      {
+        "name": "Kecepatan Serangan",
+        "value": "$MBPS Mbps",
+        "inline": false
+      },
+      {
+        "name": "Waktu (WIB)",
+        "value": "$TIMESTAMP",
+        "inline": false
+      }
+    ],
+    "image": {
+      "url": "$CHART_URL"
+    },
+    "footer": {
+      "text": "Cibe Shield - Path Network Alerts"
+    }
+  }]
+}
+EOF
+    
+elif [ "$TYPE" = "filtered" ]; then
+    # Yellow embed - Attack Filtered
+    cat <<EOF | curl -s -X POST "$WEBHOOK_URL" \
+        -H "Content-Type: application/json" \
+        -d @- > /dev/null
+{
+  "embeds": [{
+    "title": "✅ Serangan Berhasil Di Filter!",
+    "description": "Serangan DDoS terdeteksi dan telah sukses di tangani oleh Cibe Shield",
+    "color": 16776960,
+    "fields": [
+      {
+        "name": "IP Attacker",
+        "value": "$IP",
+        "inline": false
+      },
+      {
+        "name": "Serangan Mengarah Port",
+        "value": "$PORT",
+        "inline": false
+      },
+      {
+        "name": "Kecepatan Serangan",
+        "value": "$MBPS Mbps (Filtered)",
+        "inline": false
+      },
+      {
+        "name": "Total Packet",
+        "value": "$TOTAL_GB GB",
+        "inline": false
+      },
+      {
+        "name": "Waktu (WIB)",
+        "value": "$TIMESTAMP",
+        "inline": false
+      }
+    ],
+    "image": {
+      "url": "$CHART_URL"
+    },
+    "footer": {
+      "text": "Cibe Shield - Path Network Alerts"
+    }
+  }]
+}
+EOF
+fi
+
+echo "Discord notification sent: $TYPE"
+EOF_NOTIFY
+
+chmod +x discord_notify.sh
+
+# Create Discord monitor with C program
 echo -e "${BLUE}[→] Creating Discord monitor system...${NC}"
 
 cat > discord_monitor.c << '\''EOF_DISCORD_MON'\''
@@ -640,8 +770,7 @@ cat > discord_monitor.c << '\''EOF_DISCORD_MON'\''
 #define EVENT_ATTACK_MITIGATED 3
 #define EVENT_DROP 4
 
-#define MAX_CHART_DATA 20
-#define CHART_UPDATE_INTERVAL 5
+#define MAX_CHART_DATA 5
 
 struct attack_event {
     __u64 timestamp;
@@ -679,123 +808,11 @@ void sig_handler(int signo) {
     stop = 1;
 }
 
-char* get_wib_timestamp() {
-    static char timestamp[64];
-    time_t now = time(NULL) + (7 * 3600);
-    struct tm *tm_info = gmtime(&now);
-    strftime(timestamp, sizeof(timestamp), "%d %B %Y (%H.%M)", tm_info);
-    return timestamp;
-}
-
-char* get_month_indonesian(int month) {
-    char *months[] = {"Januari", "Februari", "Maret", "April", "Mei", "Juni",
-                      "Juli", "Agustus", "September", "Oktober", "November", "Desember"};
-    return months[month];
-}
-
-char* format_bytes(__u64 bytes) {
-    static char result[64];
-    double gb = bytes / (1024.0 * 1024.0 * 1024.0);
-    snprintf(result, sizeof(result), "%.2f GB", gb);
-    return result;
-}
-
-char* generate_chart_url(struct attack_tracking *track) {
-    static char url[4096];
-    char data_points[1024] = "";
-    char labels[512] = "";
-    
-    int count = track->history_count < MAX_CHART_DATA ? track->history_count : MAX_CHART_DATA;
-    
-    for (int i = 0; i < count; i++) {
-        char point[32];
-        snprintf(point, sizeof(point), "%s%u", i > 0 ? "," : "", track->mbps_history[i]);
-        strcat(data_points, point);
-        
-        char label[32];
-        snprintf(label, sizeof(label), "%s'%ds'", i > 0 ? "," : "", i * CHART_UPDATE_INTERVAL);
-        strcat(labels, label);
-    }
-    
-    snprintf(url, sizeof(url),
-        "https://quickchart.io/chart?width=800&height=400&devicePixelRatio=2&c="
-        "{type:'line',data:{labels:[%s],datasets:[{label:'Attack Rate (Mbps)',data:[%s],"
-        "borderColor:'rgb(255,99,132)',backgroundColor:'rgba(255,99,132,0.2)',fill:true}]},"
-        "options:{title:{display:true,text:'DDoS Attack Traffic Rate'},scales:{yAxes:[{ticks:{beginAtZero:true}}]}}}",
-        labels, data_points);
-    
-    return url;
-}
-
-void send_discord_webhook(const char *webhook_url, const char *json_payload) {
-    FILE *fp = popen("curl -s -X POST -H 'Content-Type: application/json' -d @- " 
-                     "'" WEBHOOK_URL "'", "w");
-    if (fp) {
-        fprintf(fp, "%s", json_payload);
-        pclose(fp);
-    }
-}
-
-void send_attack_start_notification(struct attack_tracking *track) {
-    char payload[8192];
-    char *chart_url = generate_chart_url(track);
-    char *timestamp = get_wib_timestamp();
-    
-    snprintf(payload, sizeof(payload),
-        "{"
-        "\"embeds\":[{"
-        "\"title\":\"🚨 Serangan DDoS Terdeteksi!!\","
-        "\"description\":\"Serangan DDoS terdeteksi dan akan segera di proses oleh sistem Cibe Shield\","
-        "\"color\":15548997,"
-        "\"fields\":["
-        "{\"name\":\"IP Attacker\",\"value\":\"%s\",\"inline\":false},"
-        "{\"name\":\"Serangan Mengarah Port\",\"value\":\"%u\",\"inline\":false},"
-        "{\"name\":\"Kecepatan Serangan\",\"value\":\"%u Mbps\",\"inline\":false},"
-        "{\"name\":\"Waktu (WIB)\",\"value\":\"%s\",\"inline\":false}"
-        "],"
-        "\"image\":{\"url\":\"%s\"},"
-        "\"footer\":{\"text\":\"Cibe Shield - Path Network Alerts\"}"
-        "}]"
-        "}",
-        track->ip_str, track->target_port, 
-        track->mbps_history[track->history_count - 1],
-        timestamp, chart_url);
-    
-    send_discord_webhook(WEBHOOK_URL, payload);
-    track->notified_start = 1;
-    printf("[DISCORD] Attack start notification sent for %s\n", track->ip_str);
-}
-
-void send_attack_filtered_notification(struct attack_tracking *track) {
-    char payload[8192];
-    char *chart_url = generate_chart_url(track);
-    char *timestamp = get_wib_timestamp();
-    char *total_data = format_bytes(track->total_bytes);
-    
-    snprintf(payload, sizeof(payload),
-        "{"
-        "\"embeds\":[{"
-        "\"title\":\"✅ Serangan Berhasil Di Filter!\","
-        "\"description\":\"Serangan DDoS terdeteksi dan telah sukses di tangani oleh Cibe Shield\","
-        "\"color\":16776960,"
-        "\"fields\":["
-        "{\"name\":\"IP Attacker\",\"value\":\"%s\",\"inline\":false},"
-        "{\"name\":\"Serangan Mengarah Port\",\"value\":\"%u\",\"inline\":false},"
-        "{\"name\":\"Kecepatan Serangan\",\"value\":\"%u Mbps (Filtered)\",\"inline\":false},"
-        "{\"name\":\"Total Packet\",\"value\":\"%s\",\"inline\":false},"
-        "{\"name\":\"Waktu (WIB)\",\"value\":\"%s\",\"inline\":false}"
-        "],"
-        "\"image\":{\"url\":\"%s\"},"
-        "\"footer\":{\"text\":\"Cibe Shield - Path Network Alerts\"}"
-        "}]"
-        "}",
-        track->ip_str, track->target_port,
-        track->mbps_history[track->history_count - 1],
-        total_data, timestamp, chart_url);
-    
-    send_discord_webhook(WEBHOOK_URL, payload);
-    track->notified_filtered = 1;
-    printf("[DISCORD] Attack filtered notification sent for %s\n", track->ip_str);
+void send_discord_notification(const char *type, const char *ip, int port, int mbps, double total_gb, const char *chart_data) {
+    char cmd[4096];
+    snprintf(cmd, sizeof(cmd), "/opt/cibe-xdp/discord_notify.sh '%s' '%s' '%d' '%d' '%.2f' '%s'",
+             type, ip, port, mbps, total_gb, chart_data);
+    system(cmd);
 }
 
 int handle_event(void *ctx, void *data, size_t data_sz) {
@@ -832,7 +849,12 @@ int handle_event(void *ctx, void *data, size_t data_sz) {
             current_attack.mbps_history[current_attack.history_count++] = event->mbps;
         }
         
-        send_attack_start_notification(&current_attack);
+        char chart_data[256];
+        snprintf(chart_data, sizeof(chart_data), "%u", event->mbps);
+        
+        double total_gb = event->total_bytes / (1024.0 * 1024.0 * 1024.0);
+        send_discord_notification("start", ip_str, event->dst_port, event->mbps, total_gb, chart_data);
+        current_attack.notified_start = 1;
         
     } else if (event->event_type == EVENT_ATTACK_ONGOING) {
         printf("\n[%s] === ATTACK ONGOING ===\n", time_str);
@@ -867,7 +889,17 @@ int handle_event(void *ctx, void *data, size_t data_sz) {
             current_attack.dropped_bytes = event->dropped_bytes;
             
             if (!current_attack.notified_filtered) {
-                send_attack_filtered_notification(&current_attack);
+                char chart_data[256];
+                int offset = 0;
+                for (int i = 0; i < current_attack.history_count && i < MAX_CHART_DATA; i++) {
+                    offset += snprintf(chart_data + offset, sizeof(chart_data) - offset, 
+                                     "%s%u", i > 0 ? "," : "", current_attack.mbps_history[i]);
+                }
+                
+                double total_gb = event->total_bytes / (1024.0 * 1024.0 * 1024.0);
+                send_discord_notification("filtered", ip_str, event->dst_port, event->mbps, 
+                                        total_gb, chart_data);
+                current_attack.notified_filtered = 1;
             }
         }
     }
@@ -941,9 +973,6 @@ EOF_DISCORD_MON
 
 echo -e "${BLUE}[→] Compiling Discord monitor...${NC}"
 
-# Fix the WEBHOOK_URL in the C code
-sed -i "s|WEBHOOK_URL|$WEBHOOK_URL|g" discord_monitor.c
-
 if gcc -O2 -Wall -o discord_monitor discord_monitor.c -lbpf -lelf 2>&1 | tee discord_compile.log; then
     if [ -f discord_monitor ]; then
         chmod +x discord_monitor
@@ -1000,12 +1029,13 @@ echo "[✓] XDP unloaded"
 EOF_UNLOAD
 chmod +x unload.sh
 
-# Create systemd service for XDP
+# Create systemd service for XDP with always-on configuration
 cat > /etc/systemd/system/cibe-xdp.service << '\''EOF_SVC'\''
 [Unit]
 Description=CIBE SHIELD XDP v3.0 Protection
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot
@@ -1013,24 +1043,26 @@ ExecStart=/opt/cibe-xdp/load.sh
 ExecStop=/opt/cibe-xdp/unload.sh
 RemainAfterExit=yes
 Restart=on-failure
-RestartSec=5
+RestartSec=5s
 
 [Install]
 WantedBy=multi-user.target
 EOF_SVC
 
-# Create systemd service for Discord monitor
+# Create systemd service for Discord monitor with always-on configuration
 cat > /etc/systemd/system/cibe-discord-monitor.service << '\''EOF_DISCORD_SVC'\''
 [Unit]
-Description=CIBE SHIELD Discord Attack Monitor
-After=cibe-xdp.service
+Description=CIBE SHIELD Discord Attack Monitor v3.0
+After=cibe-xdp.service network-online.target
 Requires=cibe-xdp.service
+Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 ExecStart=/opt/cibe-xdp/discord_monitor
 Restart=always
-RestartSec=5
+RestartSec=5s
 StandardOutput=journal
 StandardError=journal
 
@@ -1063,25 +1095,36 @@ if ./load.sh; then
         echo -e "  Detection     : ${CYAN}SA-MP + RakNet + Pattern Analysis${NC}"
         echo -e "  Monitoring    : ${CYAN}Ring Buffer Event Streaming${NC}"
         echo -e "  Discord Alerts: ${GREEN}ENABLED${NC}"
+        echo -e "  Auto-Restart  : ${GREEN}ALWAYS ON (survives reboot)${NC}"
         echo -e "  Chart API     : ${CYAN}QuickChart.io${NC}"
         echo ""
         echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
         echo -e "${BLUE}  DISCORD INTEGRATION${NC}"
         echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-        echo -e "  🚨 ${GREEN}Attack Start Notification${NC}"
-        echo -e "     • Red embed with attack details"
+        echo -e "  🔴 ${GREEN}Attack Start Notification${NC}"
+        echo -e "     • Red embed (Color: 15548997)"
         echo -e "     • IP, Port, Mbps, Timestamp (WIB)"
         echo -e "     • Real-time traffic chart"
         echo ""
-        echo -e "  ✅ ${GREEN}Attack Filtered Notification${NC}"
-        echo -e "     • Yellow embed with mitigation results"
+        echo -e "  🟡 ${GREEN}Attack Filtered Notification${NC}"
+        echo -e "     • Yellow embed (Color: 16776960)"
         echo -e "     • Total data blocked (GB)"
         echo -e "     • Updated traffic chart"
         echo ""
         echo -e "  📊 ${GREEN}Chart Generation${NC}"
         echo -e "     • QuickChart.io API"
         echo -e "     • Real-time Mbps tracking"
-        echo -e "     • 20-point history graph"
+        echo -e "     • 5-point history graph"
+        echo ""
+        echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo -e "${BLUE}  ALWAYS-ON CONFIGURATION${NC}"
+        echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo -e "  ${GREEN}✓${NC} Auto-start on boot (systemd enabled)"
+        echo -e "  ${GREEN}✓${NC} Auto-restart on failure (Restart=always)"
+        echo -e "  ${GREEN}✓${NC} Indefinite restart attempts (StartLimitIntervalSec=0)"
+        echo -e "  ${GREEN}✓${NC} 5-second restart delay (RestartSec=5s)"
+        echo -e "  ${GREEN}✓${NC} Survives VPS reboot"
+        echo -e "  ${GREEN}✓${NC} Service dependency management"
         echo ""
         echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
         echo -e "${BLUE}  DEFENSE LAYERS${NC}"
@@ -1098,14 +1141,16 @@ if ./load.sh; then
         echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
         echo -e "  XDP Status        : ${YELLOW}systemctl status cibe-xdp${NC}"
         echo -e "  Discord Monitor   : ${YELLOW}systemctl status cibe-discord-monitor${NC}"
-        echo -e "  Start Discord Mon : ${YELLOW}systemctl start cibe-discord-monitor${NC}"
+        echo -e "  Start Discord     : ${YELLOW}systemctl start cibe-discord-monitor${NC}"
+        echo -e "  Stop Discord      : ${YELLOW}systemctl stop cibe-discord-monitor${NC}"
         echo -e "  View Logs         : ${YELLOW}journalctl -u cibe-discord-monitor -f${NC}"
         echo -e "  Manual Monitor    : ${YELLOW}/opt/cibe-xdp/discord_monitor${NC}"
+        echo -e "  Manual Notify     : ${YELLOW}/opt/cibe-xdp/discord_notify.sh${NC}"
         echo -e "  Reload XDP        : ${YELLOW}/opt/cibe-xdp/load.sh${NC}"
         echo -e "  Uninstall         : ${YELLOW}bash <script> uninstall${NC}"
         echo ""
         echo -e "${GREEN}[✓] CIBE SHIELD XDP v3.0 with Discord Integration active!${NC}"
-        echo -e "${GREEN}[✓] Discord notifications will be sent on attacks!${NC}"
+        echo -e "${GREEN}[✓] Services configured to survive reboots and auto-restart!${NC}"
         echo -e "${GREEN}[✓] Starting Discord monitor service...${NC}"
         echo ""
         
@@ -1115,10 +1160,16 @@ if ./load.sh; then
         
         if systemctl is-active --quiet cibe-discord-monitor.service; then
             echo -e "${GREEN}[✓] Discord monitor service started successfully!${NC}"
+            echo -e "${GREEN}[✓] System is now fully protected and monitored!${NC}"
         else
             echo -e "${YELLOW}[!] Discord monitor service failed to start${NC}"
             echo -e "${YELLOW}[!] Check logs: journalctl -u cibe-discord-monitor -n 50${NC}"
         fi
+        
+        echo ""
+        echo -e "${MAGENTA}[INFO] Testing Discord webhook...${NC}"
+        /opt/cibe-xdp/discord_notify.sh start "TEST.IP.ADDRESS" 7777 25 1.5 "25,30,28,26,24"
+        echo -e "${GREEN}[✓] Test notification sent to Discord!${NC}"
         
     else
         echo -e "${RED}[✗] XDP not attached${NC}"
