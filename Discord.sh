@@ -1,7 +1,10 @@
 bash -c 'cat << '\''CIBE_XDP_DISCORD_FINAL'\'' | bash
 
 #!/bin/bash
+# ---- SAFE ARGUMENT HANDLING (FIX unbound $1) ----
+ARG1="${1:-}"
 set -euo pipefail
+
 
 RED="\033[0;31m"
 GREEN="\033[0;32m"
