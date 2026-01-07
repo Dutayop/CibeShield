@@ -1,4 +1,3 @@
-
 bash -c 'cat << '\''CIBE_XDP_V3'\'' | bash
 
 #!/bin/bash
@@ -18,7 +17,7 @@ echo "╔═══════════════════════�
 echo "║                                                            ║"
 echo "║      CIBE SHIELD XDP v3.0 - ULTIMATE PROTECTION            ║"
 echo "║       Advanced DDoS Detection & Mitigation System          ║"
-echo "║       Real-Time Monitoring • Event Streaming • Analytics   ║"
+echo "║       Real-Time Monitoring • Ring Buffer • Analytics       ║"
 echo "║                                                            ║"
 echo "╚════════════════════════════════════════════════════════════╝"
 echo -e "${NC}"
@@ -85,11 +84,11 @@ echo -e "${BLUE}[→] Configuring interface...${NC}"
 ethtool -K "$IFACE" gro off lro off tso off gso off 2>/dev/null || true
 echo -e "${GREEN}[✓] Interface configured${NC}"
 
-echo -e "${BLUE}[→] Creating advanced XDP program with BPF maps...${NC}"
+echo -e "${BLUE}[→] Creating advanced XDP program with Ring Buffer...${NC}"
 
 cat > xdp_shield.c << '\''EOF_XDP'\''
 /* SPDX-License-Identifier: GPL-2.0 */
-/* CIBE SHIELD XDP v3.0 - Ultimate DDoS Protection with Real-Time Monitoring */
+/* CIBE SHIELD XDP v3.0 - Ultimate DDoS Protection with Ring Buffer */
 
 #define SEC(NAME) __attribute__((section(NAME), used))
 #define __always_inline inline __attribute__((__always_inline__))
@@ -139,16 +138,13 @@ struct udphdr {
 static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *) 1;
 static long (*bpf_map_update_elem)(void *map, const void *key, const void *value, __u64 flags) = (void *) 2;
 static __u64 (*bpf_ktime_get_ns)(void) = (void *) 5;
-static long (*bpf_perf_event_output)(void *ctx, void *map, __u64 flags, void *data, __u64 size) = (void *) 25;
-static long (*bpf_get_smp_processor_id)(void) = (void *) 8;
+static long (*bpf_ringbuf_output)(void *ringbuf, void *data, __u64 size, __u64 flags) = (void *) 130;
 
 #define BPF_MAP_TYPE_HASH 1
 #define BPF_MAP_TYPE_LRU_HASH 9
-#define BPF_MAP_TYPE_PERCPU_HASH 5
-#define BPF_MAP_TYPE_PERF_EVENT_ARRAY 4
 #define BPF_MAP_TYPE_ARRAY 2
+#define BPF_MAP_TYPE_RINGBUF 27
 #define BPF_ANY 0
-#define BPF_F_CURRENT_CPU 0xffffffffULL
 
 #define ETH_P_IP 0x0800
 #define IPPROTO_UDP 17
@@ -294,13 +290,10 @@ struct bpf_map_def SEC("maps") global_stats_map = {
     .map_flags = 0,
 };
 
-/* MAP 3: Attack events - perf event array for userspace monitoring */
+/* MAP 3: Ring buffer for attack events */
 struct bpf_map_def SEC("maps") attack_events = {
-    .type = BPF_MAP_TYPE_PERF_EVENT_ARRAY,
-    .key_size = sizeof(__u32),
-    .value_size = sizeof(__u32),
-    .max_entries = 0,
-    .map_flags = 0,
+    .type = BPF_MAP_TYPE_RINGBUF,
+    .max_entries = 256 * 4096,  /* 1MB ring buffer */
 };
 
 /* Protocol validation functions */
@@ -347,8 +340,6 @@ static __always_inline int is_gaming_traffic(void *payload, void *data_end, __u1
 /* Calculate Mbps from bytes and time window */
 static __always_inline __u32 calculate_mbps(__u64 bytes, __u64 time_ns) {
     if (time_ns == 0) return 0;
-    /* Mbps = (bytes * 8) / (time_ns / 1000000000) / 1000000 */
-    /* Simplified: (bytes * 8 * 1000) / (time_ns / 1000000) */
     __u64 bits = bytes * 8;
     __u64 time_ms = time_ns / 1000000;
     if (time_ms == 0) return 0;
@@ -364,34 +355,26 @@ static __always_inline __u32 calculate_attack_score(
 ) {
     __u32 score = 0;
     
-    /* Suspicious packet sizes */
     if (pkt_bytes < MIN_PACKET_SIZE) score += 20;
     if (pkt_bytes == 1024 || pkt_bytes == 1490 || pkt_bytes == 666) score += 15;
     
-    /* Port scanning behavior */
     if (stats->last_port != 0 && stats->last_port != dport) score += 10;
     
-    /* Non-gaming traffic to gaming ports */
     if (dport >= PORT_MIN && dport <= PORT_MAX && !is_gaming) score += 25;
     
-    /* High connection attempt rate */
     if (stats->connection_attempts > MAX_INIT_ATTEMPTS) score += 30;
     
-    /* Burst pattern typical of floods */
     if (stats->burst_packets > BURST_PPS) score += 20;
     
-    /* High bandwidth usage */
     if (stats->mbps > ATTACK_MBPS_THRESHOLD) score += 40;
     
-    /* High PPS rate */
     if (stats->packets > ATTACK_PPS_THRESHOLD) score += 35;
     
     return score;
 }
 
-/* Send attack event to userspace */
+/* Send attack event to userspace via ring buffer */
 static __always_inline void send_attack_event(
-    struct xdp_md *ctx,
     __u32 src_ip,
     __u16 dst_port,
     struct traffic_stats *stats,
@@ -409,8 +392,7 @@ static __always_inline void send_attack_event(
     event.attack_score = stats->attack_score;
     event.event_type = event_type;
     
-    bpf_perf_event_output(ctx, &attack_events, BPF_F_CURRENT_CPU, 
-                         &event, sizeof(event));
+    bpf_ringbuf_output(&attack_events, &event, sizeof(event), 0);
 }
 
 /* Update global statistics */
@@ -498,7 +480,6 @@ int xdp_shield_filter(struct xdp_md *ctx) {
     /* === TIER 1: Main Window Reset (1 second) === */
     __u64 time_since_reset = now - stats->last_reset;
     if (time_since_reset > TIME_WINDOW) {
-        /* Calculate Mbps for the last window */
         stats->mbps = calculate_mbps(stats->bytes, time_since_reset);
         
         if (stats->mbps > stats->peak_mbps)
@@ -511,8 +492,6 @@ int xdp_shield_filter(struct xdp_md *ctx) {
     } else {
         stats->bytes += pkt_bytes;
         stats->packets += 1;
-        
-        /* Calculate current Mbps */
         stats->mbps = calculate_mbps(stats->bytes, time_since_reset);
     }
     
@@ -526,11 +505,9 @@ int xdp_shield_filter(struct xdp_md *ctx) {
         stats->burst_packets += 1;
     }
     
-    /* Update gaming classification */
     if (is_gaming)
         stats->is_gaming = 1;
     
-    /* Track connection attempts and ports */
     if (sport != stats->last_port)
         stats->connection_attempts += 1;
     
@@ -541,7 +518,6 @@ int xdp_shield_filter(struct xdp_md *ctx) {
     __u32 attack_score = calculate_attack_score(stats, pkt_bytes, dport, is_gaming);
     stats->attack_score = attack_score;
     
-    /* Check if this is an attack based on multiple factors */
     __u8 is_attack = 0;
     if (attack_score >= ATTACK_SCORE_THRESHOLD ||
         stats->mbps >= ATTACK_MBPS_THRESHOLD ||
@@ -551,10 +527,8 @@ int xdp_shield_filter(struct xdp_md *ctx) {
     
     /* Attack state management and notification */
     if (is_attack && !stats->under_attack) {
-        /* Attack just started */
         stats->under_attack = 1;
         stats->attack_notified = 0;
-        update_global_stats(0, 0);
         __u32 key = 0;
         struct global_stats *gstats = bpf_map_lookup_elem(&global_stats_map, &key);
         if (gstats) {
@@ -569,12 +543,10 @@ int xdp_shield_filter(struct xdp_md *ctx) {
             stats->last_attack_check = now;
             
             if (!stats->attack_notified) {
-                /* First notification - attack started */
-                send_attack_event(ctx, ip->saddr, dport, stats, EVENT_ATTACK_START);
+                send_attack_event(ip->saddr, dport, stats, EVENT_ATTACK_START);
                 stats->attack_notified = 1;
             } else {
-                /* Ongoing attack update */
-                send_attack_event(ctx, ip->saddr, dport, stats, EVENT_ATTACK_ONGOING);
+                send_attack_event(ip->saddr, dport, stats, EVENT_ATTACK_ONGOING);
             }
         }
     }
@@ -586,7 +558,7 @@ int xdp_shield_filter(struct xdp_md *ctx) {
         stats->dropped_packets += 1;
         
         if (stats->under_attack) {
-            send_attack_event(ctx, ip->saddr, dport, stats, EVENT_DROP);
+            send_attack_event(ip->saddr, dport, stats, EVENT_DROP);
         }
         
         update_global_stats(pkt_bytes, 1);
@@ -599,7 +571,7 @@ int xdp_shield_filter(struct xdp_md *ctx) {
         stats->dropped_packets += 1;
         
         if (stats->under_attack) {
-            send_attack_event(ctx, ip->saddr, dport, stats, EVENT_DROP);
+            send_attack_event(ip->saddr, dport, stats, EVENT_DROP);
         }
         
         update_global_stats(pkt_bytes, 1);
@@ -610,7 +582,6 @@ int xdp_shield_filter(struct xdp_md *ctx) {
     __u64 byte_limit = stats->is_gaming ? GAMING_BPS_T1 : NORMAL_BPS_T1;
     __u32 pkt_limit = stats->is_gaming ? GAMING_PPS_T1 : NORMAL_PPS_T1;
     
-    /* Apply stricter limits if suspicious */
     if (stats->suspicious_pattern) {
         byte_limit = byte_limit / 2;
         pkt_limit = pkt_limit / 2;
@@ -621,14 +592,13 @@ int xdp_shield_filter(struct xdp_md *ctx) {
         stats->dropped_packets += 1;
         
         if (stats->under_attack) {
-            send_attack_event(ctx, ip->saddr, dport, stats, EVENT_DROP);
+            send_attack_event(ip->saddr, dport, stats, EVENT_DROP);
         }
         
         update_global_stats(pkt_bytes, 1);
         return XDP_DROP;
     }
     
-    /* Packet passed all checks */
     update_global_stats(pkt_bytes, 0);
     return XDP_PASS;
 }
@@ -657,7 +627,7 @@ fi
 
 echo "$IFACE" > interface.conf
 
-# Create userspace monitor program
+# Create userspace monitor program with fixed API
 echo -e "${BLUE}[→] Creating monitoring system...${NC}"
 
 cat > monitor.c << '\''EOF_MONITOR'\''
@@ -670,11 +640,6 @@ cat > monitor.c << '\''EOF_MONITOR'\''
 #include <errno.h>
 #include <time.h>
 #include <arpa/inet.h>
-#include <linux/perf_event.h>
-#include <linux/bpf.h>
-#include <sys/ioctl.h>
-#include <sys/mman.h>
-#include <sys/syscall.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 
@@ -682,9 +647,6 @@ cat > monitor.c << '\''EOF_MONITOR'\''
 #define EVENT_ATTACK_ONGOING 2
 #define EVENT_ATTACK_END 3
 #define EVENT_DROP 4
-
-#define PERF_BUFFER_PAGES 64
-#define PERF_SAMPLE_MAX_SIZE 256
 
 struct attack_event {
     __u32 src_ip;
@@ -741,19 +703,16 @@ void print_event(struct attack_event *event) {
     fflush(stdout);
 }
 
-void handle_event(void *ctx, int cpu, void *data, __u32 size) {
-    struct attack_event *event = (struct attack_event *)data;
-    print_event(event);
-}
-
-void handle_lost_events(void *ctx, int cpu, __u64 lost_cnt) {
-    fprintf(stderr, "Lost %llu events on CPU %d\n", lost_cnt, cpu);
+int handle_event(void *ctx, void *data, size_t data_sz) {
+    const struct attack_event *event = data;
+    print_event((struct attack_event *)event);
+    return 0;
 }
 
 int main(int argc, char **argv) {
     struct bpf_object *obj;
     struct bpf_map *events_map;
-    struct perf_buffer *pb = NULL;
+    struct ring_buffer *rb = NULL;
     int err;
     
     signal(SIGINT, sig_handler);
@@ -775,18 +734,17 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
     
-    /* Find the perf event map */
+    /* Find the ring buffer map */
     events_map = bpf_object__find_map_by_name(obj, "attack_events");
     if (!events_map) {
         fprintf(stderr, "Failed to find attack_events map\n");
         goto cleanup;
     }
     
-    /* Setup perf buffer */
-    pb = perf_buffer__new(bpf_map__fd(events_map), PERF_BUFFER_PAGES,
-                          handle_event, handle_lost_events, NULL, NULL);
-    if (!pb) {
-        fprintf(stderr, "Failed to create perf buffer\n");
+    /* Setup ring buffer */
+    rb = ring_buffer__new(bpf_map__fd(events_map), handle_event, NULL, NULL);
+    if (!rb) {
+        fprintf(stderr, "Failed to create ring buffer\n");
         goto cleanup;
     }
     
@@ -794,9 +752,9 @@ int main(int argc, char **argv) {
     
     /* Poll for events */
     while (!stop) {
-        err = perf_buffer__poll(pb, 100);
+        err = ring_buffer__poll(rb, 100);
         if (err < 0 && err != -EINTR) {
-            fprintf(stderr, "Error polling perf buffer: %d\n", err);
+            fprintf(stderr, "Error polling ring buffer: %d\n", err);
             break;
         }
     }
@@ -804,8 +762,8 @@ int main(int argc, char **argv) {
     printf("\nShutting down monitor...\n");
     
 cleanup:
-    if (pb)
-        perf_buffer__free(pb);
+    if (rb)
+        ring_buffer__free(rb);
     if (obj)
         bpf_object__close(obj);
     
@@ -929,11 +887,11 @@ if ./load.sh; then
         echo -e "${BLUE}  SYSTEM INFORMATION${NC}"
         echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
         echo -e "  Interface     : ${GREEN}$IFACE${NC}"
-        echo -e "  Version       : ${CYAN}3.0 Ultimate${NC}"
+        echo -e "  Version       : ${CYAN}3.0 Ultimate Edition${NC}"
         echo -e "  Protection    : ${CYAN}6-Tier Defense System${NC}"
         echo -e "  Detection     : ${CYAN}SA-MP + RakNet + Pattern Analysis${NC}"
-        echo -e "  Monitoring    : ${CYAN}Real-Time Event Streaming${NC}"
-        echo -e "  Maps          : ${CYAN}LRU Hash (512K) + Perf Events + Global Stats${NC}"
+        echo -e "  Monitoring    : ${CYAN}Ring Buffer Event Streaming${NC}"
+        echo -e "  Maps          : ${CYAN}LRU Hash (512K) + Ring Buffer (1MB) + Global Stats${NC}"
         echo ""
         echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
         echo -e "${BLUE}  DEFENSE LAYERS${NC}"
@@ -977,7 +935,7 @@ if ./load.sh; then
         echo -e "  ${GREEN}✓${NC} Mitigates port scan floods"
         echo -e "  ${GREEN}✓${NC} Stops connection attempt floods"
         echo -e "  ${GREEN}✓${NC} Real-time attack tracking"
-        echo -e "  ${GREEN}✓${NC} Automatic event notifications"
+        echo -e "  ${GREEN}✓${NC} Ring buffer event notifications"
         echo -e "  ${GREEN}✓${NC} Comprehensive statistics"
         echo ""
         echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
@@ -1036,7 +994,7 @@ if ./load.sh; then
         echo -e "  Uninstall     : ${YELLOW}bash <script> uninstall${NC}"
         echo ""
         echo -e "${GREEN}[✓] CIBE SHIELD XDP v3.0 is now protecting your server!${NC}"
-        echo -e "${GREEN}[✓] Real-time attack monitoring active!${NC}"
+        echo -e "${GREEN}[✓] Real-time attack monitoring with ring buffer!${NC}"
         echo -e "${GREEN}[✓] Can block 20+ Mbps attacks with zero false positives!${NC}"
         echo ""
     else
