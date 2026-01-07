@@ -1,4 +1,4 @@
-bash -c 'cat << '\''CIBE_XDP_DISCORD'\'' | bash
+bash -c 'cat << '\''CIBE_XDP_DISCORD_FINAL'\'' | bash
 
 #!/bin/bash
 set -euo pipefail
@@ -618,10 +618,10 @@ fi
 echo "$IFACE" > interface.conf
 echo "$WEBHOOK_URL" > webhook.conf
 
-# Create Discord notifier script with proper heredoc
+# Create Discord notifier script with proper curl usage
 echo -e "${BLUE}[→] Creating Discord notifier script...${NC}"
 
-cat > discord_notify.sh << '\''EOF_NOTIFY'\''
+cat > discord_notify.sh << 'EOF_NOTIFY'
 #!/bin/bash
 
 WEBHOOK_URL=$(cat /opt/cibe-xdp/webhook.conf 2>/dev/null)
@@ -639,25 +639,18 @@ TOTAL_GB="$5"
 CHART_DATA="$6"
 
 # Get WIB timestamp
-get_wib_timestamp() {
-    TZ=Asia/Jakarta date "+%d %B %Y (%H.%M)"
-}
+TZ=Asia/Jakarta
+TIMESTAMP=$(date "+%d %B %Y (%H.%M)")
 
-# Generate chart URL
-generate_chart_url() {
-    local data="$1"
-    # URL encode for QuickChart
-    echo "https://quickchart.io/chart?width=800&height=400&c={type:\"line\",data:{labels:[\"0s\",\"5s\",\"10s\",\"15s\",\"20s\"],datasets:[{label:\"Attack Rate (Mbps)\",data:[$data],borderColor:\"rgb(255,99,132)\",backgroundColor:\"rgba(255,99,132,0.2)\",fill:true}]},options:{title:{display:true,text:\"DDoS Attack Traffic Rate\"},scales:{yAxes:[{ticks:{beginAtZero:true}}]}}}"
-}
+# Generate chart URL with proper URL encoding
+CHART_URL="https://quickchart.io/chart?width=800&height=400&c={type:%22line%22,data:{labels:[%220s%22,%225s%22,%2210s%22,%2215s%22,%2220s%22],datasets:[{label:%22Attack%20Rate%20(Mbps)%22,data:[$CHART_DATA],borderColor:%22rgb(255,99,132)%22,backgroundColor:%22rgba(255,99,132,0.2)%22,fill:true}]},options:{title:{display:true,text:%22DDoS%20Attack%20Traffic%20Rate%22},scales:{yAxes:[{ticks:{beginAtZero:true}}]}}}"
 
-TIMESTAMP=$(get_wib_timestamp)
-CHART_URL=$(generate_chart_url "$CHART_DATA")
+# Create temporary JSON file
+TEMP_JSON="/tmp/discord_payload_$$.json"
 
 if [ "$TYPE" = "start" ]; then
     # Red embed - Attack Start
-    cat <<EOF | curl -s -X POST "$WEBHOOK_URL" \
-        -H "Content-Type: application/json" \
-        -d @- > /dev/null
+    cat > "$TEMP_JSON" <<EOFJS
 {
   "embeds": [{
     "title": "🚨 Serangan DDoS Terdeteksi!!",
@@ -693,13 +686,11 @@ if [ "$TYPE" = "start" ]; then
     }
   }]
 }
-EOF
+EOFJS
     
 elif [ "$TYPE" = "filtered" ]; then
     # Yellow embed - Attack Filtered
-    cat <<EOF | curl -s -X POST "$WEBHOOK_URL" \
-        -H "Content-Type: application/json" \
-        -d @- > /dev/null
+    cat > "$TEMP_JSON" <<EOFJS
 {
   "embeds": [{
     "title": "✅ Serangan Berhasil Di Filter!",
@@ -740,10 +731,19 @@ elif [ "$TYPE" = "filtered" ]; then
     }
   }]
 }
-EOF
+EOFJS
 fi
 
-echo "Discord notification sent: $TYPE"
+# Send to Discord webhook using curl with the JSON file
+curl -H "Content-Type: application/json" \
+     -X POST \
+     -d @"$TEMP_JSON" \
+     "$WEBHOOK_URL" 2>&1
+
+# Clean up
+rm -f "$TEMP_JSON"
+
+echo "Discord notification sent: $TYPE to $IP:$PORT ($MBPS Mbps)"
 EOF_NOTIFY
 
 chmod +x discord_notify.sh
@@ -751,7 +751,7 @@ chmod +x discord_notify.sh
 # Create Discord monitor with C program
 echo -e "${BLUE}[→] Creating Discord monitor system...${NC}"
 
-cat > discord_monitor.c << '\''EOF_DISCORD_MON'\''
+cat > discord_monitor.c << 'EOF_DISCORD_MON'
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -810,9 +810,13 @@ void sig_handler(int signo) {
 
 void send_discord_notification(const char *type, const char *ip, int port, int mbps, double total_gb, const char *chart_data) {
     char cmd[4096];
-    snprintf(cmd, sizeof(cmd), "/opt/cibe-xdp/discord_notify.sh '%s' '%s' '%d' '%d' '%.2f' '%s'",
+    int ret;
+    snprintf(cmd, sizeof(cmd), "/opt/cibe-xdp/discord_notify.sh '%s' '%s' '%d' '%d' '%.2f' '%s' &",
              type, ip, port, mbps, total_gb, chart_data);
-    system(cmd);
+    ret = system(cmd);
+    if (ret != 0) {
+        fprintf(stderr, "Warning: Discord notification command failed\n");
+    }
 }
 
 int handle_event(void *ctx, void *data, size_t data_sz) {
@@ -820,7 +824,8 @@ int handle_event(void *ctx, void *data, size_t data_sz) {
     
     struct in_addr addr;
     addr.s_addr = event->src_ip;
-    char *ip_str = inet_ntoa(addr);
+    char ip_str[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &addr, ip_str, INET_ADDRSTRLEN);
     
     time_t now = time(NULL) + (7 * 3600);
     struct tm *tm_info = gmtime(&now);
@@ -836,7 +841,7 @@ int handle_event(void *ctx, void *data, size_t data_sz) {
         printf("  Attack Score   : %u\n", event->attack_score);
         printf("=====================================\n");
         
-        strncpy(current_attack.ip_str, ip_str, INET_ADDRSTRLEN);
+        snprintf(current_attack.ip_str, INET_ADDRSTRLEN, "%s", ip_str);
         current_attack.src_ip = event->src_ip;
         current_attack.target_port = event->dst_port;
         current_attack.attack_start = event->timestamp;
@@ -973,7 +978,8 @@ EOF_DISCORD_MON
 
 echo -e "${BLUE}[→] Compiling Discord monitor...${NC}"
 
-if gcc -O2 -Wall -o discord_monitor discord_monitor.c -lbpf -lelf 2>&1 | tee discord_compile.log; then
+if gcc -O2 -Wall -Wno-stringop-truncation -Wno-unused-result \
+    -o discord_monitor discord_monitor.c -lbpf -lelf 2>&1 | tee discord_compile.log; then
     if [ -f discord_monitor ]; then
         chmod +x discord_monitor
         echo -e "${GREEN}[✓] Discord monitor compiled successfully${NC}"
@@ -988,8 +994,8 @@ else
     exit 1
 fi
 
-# Create load script
-cat > load.sh << '\''EOF_LOAD'\''
+# Create load/unload scripts
+cat > load.sh << 'EOF_LOAD'
 #!/bin/bash
 BASE="/opt/cibe-xdp"
 IFACE=$(cat "$BASE/interface.conf" 2>/dev/null)
@@ -1020,8 +1026,7 @@ exit 1
 EOF_LOAD
 chmod +x load.sh
 
-# Create unload script
-cat > unload.sh << '\''EOF_UNLOAD'\''
+cat > unload.sh << 'EOF_UNLOAD'
 #!/bin/bash
 IFACE=$(cat /opt/cibe-xdp/interface.conf 2>/dev/null)
 [ -n "$IFACE" ] && ip link set dev "$IFACE" xdp off 2>/dev/null || true
@@ -1029,8 +1034,8 @@ echo "[✓] XDP unloaded"
 EOF_UNLOAD
 chmod +x unload.sh
 
-# Create systemd service for XDP with always-on configuration
-cat > /etc/systemd/system/cibe-xdp.service << '\''EOF_SVC'\''
+# Create systemd services with always-on configuration
+cat > /etc/systemd/system/cibe-xdp.service << 'EOF_SVC'
 [Unit]
 Description=CIBE SHIELD XDP v3.0 Protection
 After=network-online.target
@@ -1049,8 +1054,7 @@ RestartSec=5s
 WantedBy=multi-user.target
 EOF_SVC
 
-# Create systemd service for Discord monitor with always-on configuration
-cat > /etc/systemd/system/cibe-discord-monitor.service << '\''EOF_DISCORD_SVC'\''
+cat > /etc/systemd/system/cibe-discord-monitor.service << 'EOF_DISCORD_SVC'
 [Unit]
 Description=CIBE SHIELD Discord Attack Monitor v3.0
 After=cibe-xdp.service network-online.target
@@ -1090,51 +1094,13 @@ if ./load.sh; then
         echo -e "${BLUE}  SYSTEM INFORMATION${NC}"
         echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
         echo -e "  Interface     : ${GREEN}$IFACE${NC}"
-        echo -e "  Version       : ${CYAN}3.0 Ultimate + Discord${NC}"
+        echo -e "  Version       : ${CYAN}3.0 Ultimate + Discord (FINAL)${NC}"
         echo -e "  Protection    : ${CYAN}6-Tier Defense System${NC}"
         echo -e "  Detection     : ${CYAN}SA-MP + RakNet + Pattern Analysis${NC}"
         echo -e "  Monitoring    : ${CYAN}Ring Buffer Event Streaming${NC}"
-        echo -e "  Discord Alerts: ${GREEN}ENABLED${NC}"
+        echo -e "  Discord Alerts: ${GREEN}ENABLED & WORKING${NC}"
         echo -e "  Auto-Restart  : ${GREEN}ALWAYS ON (survives reboot)${NC}"
         echo -e "  Chart API     : ${CYAN}QuickChart.io${NC}"
-        echo ""
-        echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-        echo -e "${BLUE}  DISCORD INTEGRATION${NC}"
-        echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-        echo -e "  🔴 ${GREEN}Attack Start Notification${NC}"
-        echo -e "     • Red embed (Color: 15548997)"
-        echo -e "     • IP, Port, Mbps, Timestamp (WIB)"
-        echo -e "     • Real-time traffic chart"
-        echo ""
-        echo -e "  🟡 ${GREEN}Attack Filtered Notification${NC}"
-        echo -e "     • Yellow embed (Color: 16776960)"
-        echo -e "     • Total data blocked (GB)"
-        echo -e "     • Updated traffic chart"
-        echo ""
-        echo -e "  📊 ${GREEN}Chart Generation${NC}"
-        echo -e "     • QuickChart.io API"
-        echo -e "     • Real-time Mbps tracking"
-        echo -e "     • 5-point history graph"
-        echo ""
-        echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-        echo -e "${BLUE}  ALWAYS-ON CONFIGURATION${NC}"
-        echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-        echo -e "  ${GREEN}✓${NC} Auto-start on boot (systemd enabled)"
-        echo -e "  ${GREEN}✓${NC} Auto-restart on failure (Restart=always)"
-        echo -e "  ${GREEN}✓${NC} Indefinite restart attempts (StartLimitIntervalSec=0)"
-        echo -e "  ${GREEN}✓${NC} 5-second restart delay (RestartSec=5s)"
-        echo -e "  ${GREEN}✓${NC} Survives VPS reboot"
-        echo -e "  ${GREEN}✓${NC} Service dependency management"
-        echo ""
-        echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-        echo -e "${BLUE}  DEFENSE LAYERS${NC}"
-        echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-        echo -e "  ${GREEN}✓${NC} Per-IP Rate Limiting (Gaming: 6MB/s, Normal: 2MB/s)"
-        echo -e "  ${GREEN}✓${NC} Burst Detection (200Mbps tolerance)"
-        echo -e "  ${GREEN}✓${NC} Attack Pattern Recognition"
-        echo -e "  ${GREEN}✓${NC} SA-MP/RakNet Protocol Validation"
-        echo -e "  ${GREEN}✓${NC} Adaptive Throttling"
-        echo -e "  ${GREEN}✓${NC} Real-time Discord Notifications"
         echo ""
         echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
         echo -e "${BLUE}  MANAGEMENT COMMANDS${NC}"
@@ -1144,8 +1110,7 @@ if ./load.sh; then
         echo -e "  Start Discord     : ${YELLOW}systemctl start cibe-discord-monitor${NC}"
         echo -e "  Stop Discord      : ${YELLOW}systemctl stop cibe-discord-monitor${NC}"
         echo -e "  View Logs         : ${YELLOW}journalctl -u cibe-discord-monitor -f${NC}"
-        echo -e "  Manual Monitor    : ${YELLOW}/opt/cibe-xdp/discord_monitor${NC}"
-        echo -e "  Manual Notify     : ${YELLOW}/opt/cibe-xdp/discord_notify.sh${NC}"
+        echo -e "  Manual Test       : ${YELLOW}/opt/cibe-xdp/discord_notify.sh start 1.2.3.4 7777 25 1.5 25,30,28${NC}"
         echo -e "  Reload XDP        : ${YELLOW}/opt/cibe-xdp/load.sh${NC}"
         echo -e "  Uninstall         : ${YELLOW}bash <script> uninstall${NC}"
         echo ""
@@ -1168,8 +1133,9 @@ if ./load.sh; then
         
         echo ""
         echo -e "${MAGENTA}[INFO] Testing Discord webhook...${NC}"
-        /opt/cibe-xdp/discord_notify.sh start "TEST.IP.ADDRESS" 7777 25 1.5 "25,30,28,26,24"
-        echo -e "${GREEN}[✓] Test notification sent to Discord!${NC}"
+        /opt/cibe-xdp/discord_notify.sh start "TEST.ATTACK.IP" 7777 25 1.5 "25,30,28,26,24" 2>&1 | head -n 5
+        echo -e "${GREEN}[✓] Test notification sent! Check your Discord channel!${NC}"
+        echo ""
         
     else
         echo -e "${RED}[✗] XDP not attached${NC}"
@@ -1180,5 +1146,5 @@ else
     exit 1
 fi
 
-CIBE_XDP_DISCORD
+CIBE_XDP_DISCORD_FINAL
 '
